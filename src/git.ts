@@ -4,6 +4,7 @@
 import type { Forge, Repo } from './store.ts';
 import {
   decodePktLines,
+  decodePktPrefix,
   hashObject,
   isObjectId,
   packetLines,
@@ -105,6 +106,8 @@ function v0Advertise(forge: Forge, repo: Repo, service: 'git-upload-pack' | 'git
 
 function v2Advertise(): Buffer {
   return pktLines([
+    '# service=git-upload-pack\n',
+    'flush',
     'version 2\n',
     'agent=forge/1.0\n',
     'ls-refs=unborn\n',
@@ -124,24 +127,34 @@ export function sidebandPack(pack: Buffer): Buffer {
   return Buffer.concat(packets);
 }
 
-function splitV2Commands(body: Buffer): { commands: Array<Array<{ key: string; value: string }>> } {
-  const commands: Array<Array<{ key: string; value: string }>> = [];
-  let current: Array<{ key: string; value: string }> = [];
+/**
+ * Split a v2 request into its argument list. The request has two sections
+ * separated by a delim packet: the first names the command (plus agent and
+ * object-format), the second carries the command's arguments. Both sections
+ * are merged into one flat list.
+ */
+function splitV2Commands(body: Buffer): { args: Array<{ key: string; value: string }> } {
+  const args: Array<{ key: string; value: string }> = [];
   for (const packet of decodePktLines(body)) {
     if (packet.kind === 'flush') break;
-    if (packet.kind === 'delim') {
-      commands.push(current);
-      current = [];
+    if (packet.kind !== 'data') continue;
+    const line = packet.payload.toString('utf8').trimEnd();
+    // Arguments come in three shapes: `key=value` (command=, agent=,
+    // object-format=), `key value` (want, have, shallow, deepen, ref-prefix)
+    // and bare flags (peel, symrefs, unborn, thin-pack, done).
+    const eq = line.indexOf('=');
+    if (eq >= 0) {
+      args.push({ key: line.slice(0, eq), value: line.slice(eq + 1) });
       continue;
     }
-    if (packet.kind !== 'data') continue;
-    const line = packet.payload.toString('utf8');
-    const eq = line.indexOf('=');
-    if (eq >= 0) current.push({ key: line.slice(0, eq), value: line.slice(eq + 1).trimEnd() });
-    else current.push({ key: line.trimEnd(), value: '' });
+    const space = line.indexOf(' ');
+    if (space >= 0) {
+      args.push({ key: line.slice(0, space), value: line.slice(space + 1) });
+      continue;
+    }
+    args.push({ key: line, value: '' });
   }
-  commands.push(current);
-  return { commands };
+  return { args };
 }
 
 function fetchObjectByOid(forge: Forge, oid: string): GitObject | undefined {
@@ -194,15 +207,16 @@ function handleUploadPack(forge: Forge, repo: Repo, body: Buffer): HandlerResult
   const packets = parsePktOrBad(body);
   if (packets === null) return BAD_REQUEST();
   const firstLine = packetLines(packets)[0] ?? '';
-  if (firstLine.trim() === 'version 2') {
+  // Protocol v2 requests start with `command=<name>`; v0 fetch requests start
+  // with `want <oid>`. (`version 2` appears only in the advertisement.)
+  if (firstLine.startsWith('command=') || firstLine.trim() === 'version 2') {
     return handleV2(forge, repo, body);
   }
   return handleV0Fetch(forge, repo, body);
 }
 
 function handleV2(forge: Forge, repo: Repo, body: Buffer): HandlerResult {
-  const { commands } = splitV2Commands(body);
-  const args = commands[0] ?? [];
+  const { args } = splitV2Commands(body);
   const command = args.find((arg) => arg.key === 'command')?.value ?? '';
   if (command === 'ls-refs') {
     const peel = args.some((arg) => arg.key === 'peel');
@@ -245,7 +259,15 @@ function handleV2(forge: Forge, repo: Repo, body: Buffer): HandlerResult {
       else if (arg.key === 'deepen' && /^\d+$/.test(arg.value)) deepen = Number(arg.value);
     }
     const plan = forge.planFetch({ wants, haves, shallowHeld, depth: deepen });
-    const sections: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), pktDelim()];
+    // The acknowledgments section is only sent when the client sent `have`
+    // lines to acknowledge: a fresh clone sends none, and its client expects
+    // the response to start with the packfile section instead. The `ready`
+    // line says the packfile follows: without it, a client that negotiated
+    // (wait-for-done) refuses any further section after the acks.
+    const sections: Buffer[] = [];
+    if (haves.length > 0 || shallowHeld.length > 0) {
+      sections.push(pktLine('acknowledgments\n'), pktLine('NAK\n'), pktLine('ready\n'), pktDelim());
+    }
     if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
       sections.push(pktLine('shallow-info\n'));
       for (const oid of plan.shallow) sections.push(pktLine(`shallow ${oid}\n`));
@@ -305,28 +327,12 @@ function handleV0Fetch(forge: Forge, repo: Repo, body: Buffer): HandlerResult {
 
 function handleReceivePack(forge: Forge, repo: Repo, body: Buffer): HandlerResult {
   // The body is: pkt-lines of ref commands, a flush, then the raw pack.
-  const packets = parsePktOrBad(body);
-  if (packets === null) return BAD_REQUEST();
+  // Only the pkt-line prefix is framed; the pack bytes after the flush are raw.
+  const prefix = decodePktPrefix(body);
+  if (prefix === null) return BAD_REQUEST();
+  const { packets, consumed: packOffset } = prefix;
   const lines = packetLines(packets);
   const commands: Array<{ oldOid: string; newOid: string; ref: string }> = [];
-  let packOffset = 0;
-  {
-    // Find where the pkt-line section ends (the first flush packet).
-    let offset = 0;
-    let foundFlush = false;
-    for (const packet of packets) {
-      if (packet.kind === 'flush') { foundFlush = true; offset += 4; break; }
-      if (packet.kind === 'data') {
-        offset += 4 + packet.payload.length;
-      } else if (packet.kind === 'delim') {
-        offset += 4;
-      } else {
-        offset += 4;
-      }
-    }
-    if (!foundFlush) return BAD_REQUEST();
-    packOffset = offset;
-  }
   for (const line of lines) {
     const fields = line.trimEnd().split(' ');
     if (fields.length < 3) continue;
@@ -355,7 +361,10 @@ function handleReceivePack(forge: Forge, repo: Repo, body: Buffer): HandlerResul
     const applied = forge.applyRefUpdate(repo, command.oldOid, command.newOid, command.ref);
     results.push(applied.ok ? `ok ${command.ref}` : `ng ${command.ref} ${applied.reason}`);
   }
-  const report = pktLines(results.map((line) => `${line}\n`));
+  // The report-status stream is itself pkt-lined inside band 1, and ends with
+  // its own flush packet before the outer flush ends the sideband stream:
+  // git's report reader dies on EOF without that inner flush.
+  const report = pktLines([...results.map((line) => `${line}\n`), 'flush']);
   const reportPackets = pktLine(Buffer.concat([Buffer.from([1]), report]));
   const out = Buffer.concat([reportPackets, pktFlush()]);
   return text(200, 'application/x-git-receive-pack-result', out);

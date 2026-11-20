@@ -89,6 +89,36 @@ export function packetLines(packets: readonly Packet[]): string[] {
   return lines;
 }
 
+/**
+ * Decode pkt-lines from the start of a buffer and stop at the first flush
+ * packet, returning the packets and the offset just past the flush. Anything
+ * after the flush (for receive-pack: the raw pack bytes) is left untouched.
+ * Returns null when the prefix is malformed or has no flush.
+ */
+export function decodePktPrefix(bytes: Uint8Array): { packets: Packet[]; consumed: number } | null {
+  const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  const packets: Packet[] = [];
+  let offset = 0;
+  while (offset < buf.length) {
+    if (offset + 4 > buf.length) return null;
+    const head = buf.subarray(offset, offset + 4).toString('ascii');
+    if (!HEX4.test(head)) return null;
+    const length = parseInt(head, 16);
+    if (length === 0) {
+      packets.push({ kind: 'flush' });
+      offset += 4;
+      return { packets, consumed: offset };
+    }
+    if (length === 1) { packets.push({ kind: 'delim' }); offset += 4; continue; }
+    if (length === 2) { packets.push({ kind: 'response-end' }); offset += 4; continue; }
+    if (length === 3 || length > PKT_LINE_MAX) return null;
+    if (offset + length > buf.length) return null;
+    packets.push({ kind: 'data', payload: buf.subarray(offset + 4, offset + length) });
+    offset += length;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // object model: parse/build
 // ---------------------------------------------------------------------------
