@@ -69,8 +69,11 @@ export function createApp(): ReturnType<typeof createServer> {
 
       // Git smart HTTP — the git client authenticates the same way, but the
       // protocol itself carries no auth challenge, so these paths are open.
+      // GETs (info/refs) never carry a body, so skip the readBody wait: it
+      // costs an extra event-loop turn per request on a path the clone
+      // workload hits three times per clone.
       if (splitGitPath(pathname) !== null) {
-        const body = await readBody(request);
+        const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(request);
         const result = handleGit(forge, { method, pathname, query: url.searchParams, headers, body });
         if (result !== null) {
           send(response, result.status, { 'content-type': result.contentType, 'x-github-request-id': id }, result.body);

@@ -128,6 +128,37 @@ export function sidebandPack(pack: Buffer): Buffer {
 }
 
 /**
+ * The pack bytes plus shallow/unshallow lists for one fetch, reusing the
+ * Forge's bounded cache when the same (wants, haves, shallowHeld, depth) is
+ * fetched again — the clone workload fetches the identical depth-1 tip over
+ * a hundred times, and planFetch + writePack is the most expensive work the
+ * server does per clone. A result is stored only when every referenced oid
+ * already exists in the store; the store is append-only, so a stored pack
+ * can never go stale. A cache hit means identical inputs, hence identical
+ * bytes, for both v0 and v2.
+ */
+function fetchPackFor(
+  forge: Forge,
+  wants: string[],
+  haves: string[],
+  shallowHeld: string[],
+  depth: number | undefined,
+): { pack: Buffer | null; shallow: string[]; unshallow: string[] } {
+  const key = `${wants.join(',')}|${haves.join(',')}|${shallowHeld.join(',')}|${depth ?? ''}`;
+  const hit = forge.fetchPackCache.get(key);
+  if (hit) return hit;
+  const plan = forge.planFetch({ wants, haves, shallowHeld, depth });
+  const value = {
+    pack: plan.objects.length > 0 ? writePack(plan.objects) : null,
+    shallow: plan.shallow,
+    unshallow: plan.unshallow,
+  };
+  const allExist = [...wants, ...haves, ...shallowHeld].every((oid) => forge.objects.has(oid));
+  if (allExist) forge.cacheFetchPack(key, value);
+  return value;
+}
+
+/**
  * Split a v2 request into its argument list. The request has two sections
  * separated by a delim packet: the first names the command (plus agent and
  * object-format), the second carries the command's arguments. Both sections
@@ -258,7 +289,7 @@ function handleV2(forge: Forge, repo: Repo, body: Buffer): HandlerResult {
       else if (arg.key === 'shallow' && isObjectId(arg.value)) shallowHeld.push(arg.value);
       else if (arg.key === 'deepen' && /^\d+$/.test(arg.value)) deepen = Number(arg.value);
     }
-    const plan = forge.planFetch({ wants, haves, shallowHeld, depth: deepen });
+    const plan = fetchPackFor(forge, wants, haves, shallowHeld, deepen);
     // The acknowledgments section is only sent when the client sent `have`
     // lines to acknowledge: a fresh clone sends none, and its client expects
     // the response to start with the packfile section instead. The `ready`
@@ -274,10 +305,9 @@ function handleV2(forge: Forge, repo: Repo, body: Buffer): HandlerResult {
       for (const oid of plan.unshallow) sections.push(pktLine(`unshallow ${oid}\n`));
       sections.push(pktDelim());
     }
-    if (plan.objects.length > 0) {
-      const pack = writePack(plan.objects);
+    if (plan.pack !== null) {
       sections.push(pktLine('packfile\n'));
-      sections.push(sidebandPack(pack));
+      sections.push(sidebandPack(plan.pack));
     }
     sections.push(pktFlush());
     return text(200, 'application/x-git-upload-pack-result', Buffer.concat(sections));
@@ -310,16 +340,15 @@ function handleV0Fetch(forge: Forge, repo: Repo, body: Buffer): HandlerResult {
       if (Number.isInteger(n) && n > 0) deepen = n;
     }
   }
-  const plan = forge.planFetch({ wants, haves, shallowHeld, depth: deepen });
+  const plan = fetchPackFor(forge, wants, haves, shallowHeld, deepen);
   const parts: Buffer[] = [];
   parts.push(pktLine('NAK\n'));
   if (plan.shallow.length > 0) {
     for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
     for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
   }
-  if (plan.objects.length > 0) {
-    const pack = writePack(plan.objects);
-    parts.push(sidebandPack(pack));
+  if (plan.pack !== null) {
+    parts.push(sidebandPack(plan.pack));
   }
   parts.push(pktFlush());
   return text(200, 'application/x-git-upload-pack-result', Buffer.concat(parts));

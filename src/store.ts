@@ -123,6 +123,25 @@ export class Forge {
   /** Every object, content-addressed and shared across repositories. */
   readonly objects = new Map<string, GitObject>();
   readonly repos = new Map<string, Repo>();
+  /**
+   * Bounded cache of fetch results: key -> the pack bytes plus the shallow /
+   * unshallow lists for one (wants, haves, shallowHeld, depth) fetch. The
+   * object store is append-only, so a pack built while every referenced oid
+   * existed can never go stale; entries are stored only on that condition
+   * (see git.ts). FIFO eviction keeps the cache bounded.
+   */
+  readonly fetchPackCache = new Map<string, { pack: Buffer | null; shallow: string[]; unshallow: string[] }>();
+
+  /** Store one fetch result, evicting the oldest entry when the cache is full. */
+  cacheFetchPack(key: string, value: { pack: Buffer | null; shallow: string[]; unshallow: string[] }): void {
+    if (this.fetchPackCache.has(key)) return;
+    if (this.fetchPackCache.size >= 64) {
+      const oldest = this.fetchPackCache.keys().next().value;
+      if (oldest !== undefined) this.fetchPackCache.delete(oldest);
+    }
+    this.fetchPackCache.set(key, value);
+  }
+
   private nextRepoId = 1;
   private repoSeq = 0;
   private commitSeq = 0;
