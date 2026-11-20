@@ -159,8 +159,7 @@ export function handleRest(forge: Forge, request: RestRequest): RestResult | nul
   }
 
   // POST /user/repos — create a repo for the viewer
-  if (tail.length === 2 && tail[0] === 'user' && tail[1] === 'repos') {
-    if (method !== 'POST') return notFound();
+  if (tail.length === 2 && tail[0] === 'user' && tail[1] === 'repos' && method === 'POST') {
     const name = asString(request.body?.name);
     if (!name || !/^[A-Za-z0-9._-]+$/.test(name)) return unprocessable('name is invalid');
     if (forge.getRepo(VIEWER_LOGIN, name)) return unprocessable(`A repository named '${name}' already exists`);
@@ -351,7 +350,9 @@ export function handleRest(forge: Forge, request: RestRequest): RestResult | nul
         }
       }
       if (tip === null && repo.refs.has(`refs/heads/${branch}`)) return notFound();
-      const created = tip === null;
+      // 201 when the file is new on the branch (or the branch is unborn),
+      // 200 when it replaces existing content.
+      const created = tip === null || forge.blobAt(tip, path) === null;
       const commitOid = forge.commitFile(repo, { parent: tip, path, content: bytes, message, branch });
       return ok(created ? 201 : 200, {
         content: { sha: blobOid, encoding: 'base64', name: path.split('/').pop() ?? path, path },

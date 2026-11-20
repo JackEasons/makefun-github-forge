@@ -649,10 +649,24 @@ function resolveField(ctx: ExecContext, parent: AnyObject, field: FieldNode): un
     return null;
   }
 
-  if (typeName === 'Edge') {
+  if (typeName === 'Edge' || typeName === 'IssueCommentEdge') {
     if (name === 'node') return (parent as unknown as { node: unknown }).node;
     if (name === 'cursor') return (parent as unknown as { cursor: string }).cursor;
-    ctx.errors.push({ message: `Cannot query field "${name}" on type "Edge".` });
+    ctx.errors.push({ message: `Cannot query field "${name}" on type "${typeName}".` });
+    return null;
+  }
+
+  if (typeName === 'IssueComment') {
+    if (name === 'id') return (parent as unknown as { id: string }).id;
+    if (name === 'body') return (parent as unknown as { body: string }).body;
+    ctx.errors.push({ message: `Cannot query field "${name}" on type "IssueComment".` });
+    return null;
+  }
+
+  // Mutation payloads carry their result under a single field name.
+  if (typeName.endsWith('Payload')) {
+    if (name in parent) return parent[name];
+    ctx.errors.push({ message: `Cannot query field "${name}" on type "${typeName}".` });
     return null;
   }
 

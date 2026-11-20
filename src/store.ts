@@ -527,9 +527,11 @@ export class Forge {
   /**
    * The objects a fetch must send for `wants`, given what the client holds.
    * No depth: reachable(wants) minus reachable(haves).
-   * Depth N: commits within N generations of wants (plus their tree closures),
-   * minus the objects reachable from the held commits; the shallow boundary is
-   * the commits at generation N-1 that still have parents.
+   * Depth N: the commits within N generations of wants (a generation step is
+   * a commit->parent edge; a tag dereference costs none), each with its tree
+   * closure — never the parents past the boundary — minus what the client
+   * holds (each held oid plus its tree closure; a shallow clone holds the
+   * boundary commit and its tree, not the boundary's parents).
    */
   planFetch(opts: {
     wants: string[];
@@ -538,8 +540,8 @@ export class Forge {
     depth?: number;
   }): { objects: GitObject[]; shallow: string[]; unshallow: string[] } {
     const heldExact = new Set([...opts.haves, ...opts.shallowHeld]);
-    const heldClosure = collectReachable(heldExact, this.lookup);
     if (opts.depth === undefined) {
+      const heldClosure = collectReachable(heldExact, this.lookup);
       const wanted = collectReachable(opts.wants, this.lookup);
       const objects: GitObject[] = [];
       for (const oid of wanted) {
@@ -550,65 +552,93 @@ export class Forge {
       return { objects, shallow: [], unshallow: [] };
     }
     const depth = Math.max(1, Math.trunc(opts.depth));
-    // Generations from the wants: gen 0 is the wants themselves.
-    const generations = new Map<string, number>();
+    // Generations from the wants: gen 0 is the wants themselves; a tag costs
+    // no generation, a parent edge costs one.
+    const genOf = new Map<string, number>();
     const queue: Array<{ oid: string; gen: number }> = [];
     for (const want of opts.wants) {
       if (!isObjectId(want)) continue;
-      if (!generations.has(want)) {
-        generations.set(want, 0);
+      if (!genOf.has(want)) {
+        genOf.set(want, 0);
         queue.push({ oid: want, gen: 0 });
       }
     }
+    const sendSet = new Set<string>();
+    const boundary: string[] = [];
     while (queue.length > 0) {
       const { oid, gen } = queue.shift()!;
-      if (gen + 1 >= depth) continue;
+      if (gen >= depth) continue;
       const object = this.objects.get(oid);
       if (!object) continue;
-      if (object.type === 'commit') {
-        for (const parent of parseCommit(object.data).parents) {
-          if (!generations.has(parent)) {
-            generations.set(parent, gen + 1);
+      if (object.type === 'tag') {
+        sendSet.add(oid);
+        const target = parseTag(object.data).object;
+        if (!genOf.has(target)) {
+          genOf.set(target, gen);
+          queue.push({ oid: target, gen });
+        }
+        continue;
+      }
+      if (object.type !== 'commit') continue;
+      sendSet.add(oid);
+      for (const treeOid of this.treeClosure(parseCommit(object.data).tree)) sendSet.add(treeOid);
+      const parents = parseCommit(object.data).parents;
+      if (gen === depth - 1) {
+        if (parents.length > 0) boundary.push(oid);
+      } else {
+        for (const parent of parents) {
+          if (!genOf.has(parent)) {
+            genOf.set(parent, gen + 1);
             queue.push({ oid: parent, gen: gen + 1 });
           }
         }
-      } else if (object.type === 'tag') {
-        const target = parseTag(object.data).object;
-        if (!generations.has(target)) {
-          generations.set(target, gen + 1);
-          queue.push({ oid: target, gen: gen + 1 });
+      }
+    }
+    // What the client already holds: each held oid plus its tree closure.
+    const heldSet = new Set<string>();
+    for (const held of heldExact) {
+      heldSet.add(held);
+      const peeled = this.peelToCommit(held);
+      if (peeled !== null) {
+        const commit = this.objects.get(peeled);
+        if (commit?.type === 'commit') {
+          for (const treeOid of this.treeClosure(parseCommit(commit.data).tree)) heldSet.add(treeOid);
         }
       }
     }
-    const boundary: string[] = [];
-    const sendCommits = new Set<string>();
-    for (const [oid, gen] of generations) {
-      if (gen === depth - 1) {
-        const object = this.objects.get(oid);
-        if (object?.type === 'commit' && parseCommit(object.data).parents.length > 0) boundary.push(oid);
-      }
-      if (!heldExact.has(oid)) sendCommits.add(oid);
-    }
-    // The objects to send: the closure of the commits being sent, minus what the client holds.
-    const sendClosure = new Set<string>();
-    for (const oid of sendCommits) {
-      for (const reachable of collectReachable([oid], this.lookup)) sendClosure.add(reachable);
-    }
     const objects: GitObject[] = [];
-    for (const oid of sendClosure) {
-      if (heldClosure.has(oid)) continue;
+    for (const oid of sendSet) {
+      if (heldSet.has(oid)) continue;
       const object = this.objects.get(oid);
       if (object) objects.push(object);
     }
     const unshallow: string[] = [];
     for (const held of opts.shallowHeld) {
-      if (!generations.has(held)) continue;
+      if (!genOf.has(held)) continue;
       const object = this.objects.get(held);
       if (object?.type !== 'commit') continue;
       const parents = parseCommit(object.data).parents;
-      if (parents.some((parent) => generations.has(parent))) unshallow.push(held);
+      if (parents.some((parent) => genOf.has(parent))) unshallow.push(held);
     }
     return { objects, shallow: boundary, unshallow };
+  }
+
+  /** Every oid in a tree's closure: the tree, its subtrees and its blobs. */
+  treeClosure(treeOid: string): Set<string> {
+    const out = new Set<string>();
+    const queue = [treeOid];
+    while (queue.length > 0) {
+      const oid = queue.shift()!;
+      if (out.has(oid)) continue;
+      const object = this.objects.get(oid);
+      if (!object || object.type !== 'tree') continue;
+      out.add(oid);
+      for (const entry of parseTree(object.data)) {
+        if (entry.mode === '40000') queue.push(entry.oid);
+        else out.add(entry.oid);
+      }
+    }
+    return out;
   }
 
   /** The commits reachable from a ref tip, newest first. */
