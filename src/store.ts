@@ -269,7 +269,8 @@ export class Forge {
       buildCommit({
         tree: treeOid,
         parents: opts.parent === null ? [] : [opts.parent],
-        message: opts.message.endsWith('\n') ? opts.message : `${opts.message}\n`,
+        // The message is stored verbatim: the API returns exactly what was PUT.
+        message: opts.message,
         author: `${VIEWER_NAME} <${VIEWER_EMAIL}>`,
         committer: `${VIEWER_NAME} <${VIEWER_EMAIL}>`,
         timestamp,
@@ -291,7 +292,7 @@ export class Forge {
       buildCommit({
         tree: treeOid,
         parents: [opts.parent],
-        message: opts.message.endsWith('\n') ? opts.message : `${opts.message}\n`,
+        message: opts.message,
         author: `${VIEWER_NAME} <${VIEWER_EMAIL}>`,
         committer: `${VIEWER_NAME} <${VIEWER_EMAIL}>`,
         timestamp,
